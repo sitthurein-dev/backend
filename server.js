@@ -77,7 +77,8 @@ const FeedCardSchema = new mongoose.Schema(
     displayName: { type: String, default: "Pre-Billionarie" },
     emojiAvatar: { type: String, default: "🚀" },
     loveCount: { type: Number, default: 0 },
-    heartbreakCount: { type: Number, default: 0 }
+    heartbreakCount: { type: Number, default: 0 },
+    commentCount: { type: Number, default: 0 }
   },
   { timestamps: true }
 );
@@ -116,10 +117,25 @@ const UserEmojiSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
+
+const CommentSchema = new mongoose.Schema(
+  {
+    id: { type: String, required: true, unique: true, index: true },
+    card_id: { type: String, required: true, index: true },
+    user_id: { type: String, required: true, index: true },
+    emojiAvatar: { type: String, default: "🚀" },
+    text: { type: String, required: true, maxlength: 120 }
+  },
+  { timestamps: true }
+);
+
+CommentSchema.index({ user_id: 1, card_id: 1, text: 1 });
+
 const FeedCard = mongoose.model("FeedCard", FeedCardSchema);
 const Reaction = mongoose.model("Reaction", ReactionSchema);
 const ShareLog = mongoose.model("ShareLog", ShareLogSchema);
 const UserEmoji = mongoose.model("UserEmoji", UserEmojiSchema);
+const FeedComment = mongoose.model("Comment", CommentSchema);
 
 // ====== ROOT / HEALTH ======
 app.get("/", (req, res) => {
@@ -211,6 +227,40 @@ const VALID_DIRECTIONS = new Set(["BUY", "SELL"]);
 const VALID_RESULTS = new Set(["WIN", "LOSS", "BREAKEVEN", "OPEN"]);
 const VALID_REACTIONS = new Set(["love", "heartbreak"]);
 
+const FIXED_COMMENTS = new Set([
+  "Nice one 👏",
+  "Clean execution 🔥",
+  "That was disciplined.",
+  "Good patience paid off.",
+  "Well managed trade.",
+  "Solid setup.",
+  "Respect the plan 💪",
+  "That entry was clean.",
+  "Good control.",
+  "Keep that process.",
+  "Don't worry, next one will be better.",
+  "Losses are part of the game.",
+  "Still in the game 💪",
+  "Good lesson here.",
+  "Reset and come back clean.",
+  "One loss does not define you.",
+  "Keep following the process.",
+  "It happens. Next trade.",
+  "Protect the mindset.",
+  "Review it, then let it go.",
+  "Interesting setup.",
+  "Clean chart.",
+  "Good review.",
+  "Step by step.",
+  "Stay consistent.",
+  "Nice idea.",
+  "Keep going.",
+  "Focus on the process.",
+  "Solid discipline.",
+  "Trade clean."
+]);
+
+
 function normalizeString(value, fallback = "", maxLength = 50) {
   const result = String(value ?? fallback).trim();
   if (!result) return fallback;
@@ -232,7 +282,17 @@ function readTradeTime(value) {
 }
 
 function cardToClient(card, userReaction = "") {
-  const tradeTime = card.tradeTime instanceof Date ? card.tradeTime : new Date(card.tradeTime);
+  let tradeTime = card.tradeTime;
+
+  if (!(tradeTime instanceof Date)) {
+    tradeTime = new Date(tradeTime);
+  }
+
+  if (Number.isNaN(tradeTime.getTime())) {
+    tradeTime = new Date();
+  }
+
+  const tradeTimeIso = tradeTime.toISOString();
 
   return {
     id: card.id,
@@ -244,14 +304,12 @@ function cardToClient(card, userReaction = "") {
     entryPrice: card.entryPrice,
     exitPrice: card.exitPrice,
     pnl: card.pnl,
-    tradeTime:
-    Number.isNaN(tradeTime.getTime()) ? 
-    new Date().toISOString() : 
-    tradeTime.toISOString(),
+    tradeTime: tradeTimeIso,
     displayName: card.displayName || "Pre-Billionarie",
     emojiAvatar: card.emojiAvatar || "🚀",
     loveCount: card.loveCount || 0,
     heartbreakCount: card.heartbreakCount || 0,
+    commentCount: card.commentCount || 0,
     userReaction
   };
 }
@@ -328,6 +386,45 @@ function validateReactionPayload(data) {
     value: { userId, cardId, reactionType }
   };
 }
+
+function validateCommentPayload(data) {
+  const userId = normalizeString(data.user_id, "", 100);
+  const cardId = normalizeString(data.card_id, "", 100);
+  const commentText = normalizeString(data.comment_text || data.text, "", 120);
+
+  if (!userId) return { ok: false, error: "Missing user_id" };
+  if (!cardId) return { ok: false, error: "Missing card_id" };
+  if (!commentText) return { ok: false, error: "Missing comment_text" };
+  if (!FIXED_COMMENTS.has(commentText)) {
+    return { ok: false, error: "Invalid comment. Please use a quick comment." };
+  }
+
+  return { ok: true, value: { userId, cardId, commentText } };
+}
+
+function commentToClient(comment) {
+  let createdAt = comment.createdAt;
+
+  if (!(createdAt instanceof Date)) {
+    createdAt = new Date(createdAt);
+  }
+
+  if (Number.isNaN(createdAt.getTime())) {
+    createdAt = new Date();
+  }
+
+  const createdAtIso = createdAt.toISOString();
+
+  return {
+    id: comment.id,
+    cardId: comment.card_id,
+    userId: comment.user_id,
+    emojiAvatar: comment.emojiAvatar || "🚀",
+    text: comment.text,
+    createdAt: createdAtIso
+  };
+}
+
 
 async function recalcReactionCounts(cardId) {
   const [loveCount, heartbreakCount] = await Promise.all([
@@ -436,7 +533,8 @@ app.post("/api/feed/share-trade", async (req, res, next) => {
       displayName: "Pre-Billionarie",
       emojiAvatar: await getEmoji(data.userId),
       loveCount: 0,
-      heartbreakCount: 0
+      heartbreakCount: 0,
+      commentCount: 0
     };
 
     const createdCard = await FeedCard.create(newCardData);
@@ -507,6 +605,95 @@ app.post("/api/feed/react", async (req, res, next) => {
       item: updatedCard ? cardToClient(updatedCard, reactionType) : null
     });
   } catch (err) {
+    return next(err);
+  }
+});
+
+
+// ====== GET COMMENTS ======
+app.get("/api/feed/comments", async (req, res, next) => {
+  try {
+    const ip = getClientIp(req);
+    if (isRateLimited(`comments:${ip}`, 120)) {
+      return res.status(429).json({ error: "Too many comment requests" });
+    }
+
+    const cardId = normalizeString(req.query.card_id || req.query.cardId, "", 100);
+    if (!cardId) {
+      return res.status(400).json({ error: "Missing card_id" });
+    }
+
+    const comments = await FeedComment.find({ card_id: cardId })
+      .sort({ createdAt: -1 })
+      .limit(50)
+      .lean();
+
+    return res.json({ items: comments.map(commentToClient) });
+  } catch (err) {
+    return next(err);
+  }
+});
+
+// ====== POST FIXED COMMENT ======
+app.post("/api/feed/comment", async (req, res, next) => {
+  try {
+    const ip = getClientIp(req);
+    if (isRateLimited(`comment:${ip}`, 30)) {
+      return res.status(429).json({ error: "Too many comment attempts. Please slow down." });
+    }
+
+    const validation = validateCommentPayload(req.body || {});
+    if (!validation.ok) {
+      return res.status(400).json({ error: validation.error });
+    }
+
+    const { userId, cardId, commentText } = validation.value;
+    const card = await FeedCard.findOne({ id: cardId }).lean();
+    if (!card) {
+      return res.status(404).json({ error: "Card not found" });
+    }
+
+    const existing = await FeedComment.findOne({
+      user_id: userId,
+      card_id: cardId,
+      text: commentText
+    }).lean();
+
+    if (existing) {
+      const currentCard = await FeedCard.findOne({ id: cardId }).lean();
+      return res.json({
+        success: true,
+        duplicate: true,
+        comment: commentToClient(existing),
+        item: currentCard ? cardToClient(currentCard, "") : null
+      });
+    }
+
+    const emojiAvatar = await getEmoji(userId);
+    const createdComment = await FeedComment.create({
+      id: "comment_" + Date.now() + "_" + Math.floor(Math.random() * 100000),
+      card_id: cardId,
+      user_id: userId,
+      emojiAvatar,
+      text: commentText
+    });
+
+    const commentCount = await FeedComment.countDocuments({ card_id: cardId });
+    const updatedCard = await FeedCard.findOneAndUpdate(
+      { id: cardId },
+      { commentCount },
+      { new: true }
+    ).lean();
+
+    return res.json({
+      success: true,
+      comment: commentToClient(createdComment.toObject()),
+      item: updatedCard ? cardToClient(updatedCard, "") : null
+    });
+  } catch (err) {
+    if (err && err.code === 11000) {
+      return res.status(400).json({ error: "Comment already posted" });
+    }
     return next(err);
   }
 });
