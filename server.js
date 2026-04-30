@@ -1,13 +1,25 @@
 const express = require("express");
 const cors = require("cors");
 const mongoose = require("mongoose");
+const { GoogleGenerativeAI } = require("@google/generative-ai");
 
 const app = express();
+
+
+// ====== GEMINI AI SETUP ======
+let genAI = null;
+
+if (process.env.GEMINI_API_KEY) {
+  genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+} else {
+  console.warn("⚠️ GEMINI_API_KEY is missing. AI coach will use fallback error responses until you add it in Render Environment Variables.");
+}
+
 
 // ====== BASIC APP HARDENING ======
 app.disable("x-powered-by");
 app.set("trust proxy", true);
-app.use(express.json({ limit: "50kb" }));
+app.use(express.json({ limit: "300kb" }));
 
 // ====== MONGODB CONNECTION ======
 const MONGO_URI = process.env.MONGO_URI;
@@ -697,6 +709,178 @@ app.post("/api/feed/comment", async (req, res, next) => {
     return next(err);
   }
 });
+
+
+// ====== AI COACH (GEMINI) ======
+function safeArray(value) {
+  if (Array.isArray(value)) {
+    return value;
+  }
+  return [];
+}
+
+function buildCoachDataSummary(journal, importedTrades, chatHistory) {
+  const safeJournal = safeArray(journal);
+  const safeImported = safeArray(importedTrades);
+  const safeHistory = safeArray(chatHistory);
+
+  const recentJournal = safeJournal.slice(0, 8).map((trade) => {
+    return {
+      pair: trade.pair || trade.market || "",
+      direction: trade.direction || "",
+      result: trade.result || "",
+      rr: trade.rr || "",
+      risk: trade.risk || 0,
+      setupTag: trade.setupTag || "",
+      emotionTag: trade.emotionTag || "",
+      mistakeTag: trade.mistakeTag || "",
+      disciplineScore: trade.disciplineScore || 0,
+      sessionLabel: trade.sessionLabel || "",
+      notes: trade.notes || ""
+    };
+  });
+
+  const recentImported = safeImported.slice(0, 12).map((trade) => {
+    return {
+      symbol: trade.symbol || "",
+      direction: trade.direction || "",
+      profit: trade.profit || 0,
+      result: trade.result || "",
+      sessionLabel: trade.sessionLabel || "",
+      lot: trade.lot || 0
+    };
+  });
+
+  const recentMessages = safeHistory.slice(-6).map((msg) => {
+    return {
+      sender: msg.sender || "",
+      text: String(msg.text || "").slice(0, 300)
+    };
+  });
+
+  const manualWins = safeJournal.filter((trade) => {
+    const result = String(trade.result || "").toUpperCase();
+    return result.includes("TP") || result === "WIN";
+  }).length;
+
+  const manualLosses = safeJournal.filter((trade) => {
+    const result = String(trade.result || "").toUpperCase();
+    return result.includes("SL") || result === "LOSS";
+  }).length;
+
+  const importedWins = safeImported.filter((trade) => {
+    return Number(trade.profit || 0) > 0;
+  }).length;
+
+  const importedLosses = safeImported.filter((trade) => {
+    return Number(trade.profit || 0) < 0;
+  }).length;
+
+  const disciplineScores = safeJournal
+    .map((trade) => Number(trade.disciplineScore || 0))
+    .filter((score) => Number.isFinite(score) && score > 0);
+
+  let avgDiscipline = 0;
+  if (disciplineScores.length > 0) {
+    const disciplineTotal = disciplineScores.reduce((sum, score) => {
+      return sum + score;
+    }, 0);
+    avgDiscipline = Math.round(disciplineTotal / disciplineScores.length);
+  }
+
+  return {
+    counts: {
+      manualTrades: safeJournal.length,
+      importedTrades: safeImported.length,
+      manualWins,
+      manualLosses,
+      importedWins,
+      importedLosses,
+      averageDiscipline: avgDiscipline
+    },
+    recentJournal,
+    recentImported,
+    recentMessages
+  };
+}
+
+app.post("/api/coach/chat", async (req, res) => {
+  try {
+    const ip = getClientIp(req);
+
+    if (isRateLimited(`coach:${ip}`, 40)) {
+      return res.status(429).json({
+        answer: "Too many coach requests. Slow down for a minute and try again."
+      });
+    }
+
+    if (!genAI) {
+      return res.status(503).json({
+        answer: "AI coach is not configured yet. Add GEMINI_API_KEY in Render Environment Variables."
+      });
+    }
+
+    const body = req.body || {};
+    const message = normalizeString(body.message, "", 1000);
+
+    if (!message) {
+      return res.status(400).json({ answer: "Missing message." });
+    }
+
+    const summary = buildCoachDataSummary(
+      body.journal,
+      body.importedTrades,
+      body.chatHistory
+    );
+
+    const model = genAI.getGenerativeModel({
+      model: process.env.GEMINI_MODEL || "gemini-1.5-flash"
+    });
+
+    const prompt = `
+You are Trade Journal Pro AI Coach.
+
+Style:
+- Speak like a real trading mentor, not a robot.
+- Keep the answer short and useful.
+- Be direct, calm, and honest.
+- No fake hype.
+- Do not promise profits.
+- Focus on discipline, risk, execution, emotions, and overtrading.
+- Always give one clear next action.
+
+User trading data:
+${JSON.stringify(summary, null, 2)}
+
+User message:
+${message}
+
+Answer format:
+1. Direct answer
+2. What the data suggests
+3. One fix rule
+`;
+
+    const result = await model.generateContent(prompt);
+    const response = await result.response;
+    const answerRaw = response.text();
+    const answer = normalizeString(answerRaw, "", 2500);
+
+    if (!answer) {
+      return res.json({
+        answer: "I could not generate a coach response. Try again."
+      });
+    }
+
+    return res.json({ answer });
+  } catch (err) {
+    console.error("AI coach error:", err);
+    return res.status(500).json({
+      answer: "AI coach failed. Try again later."
+    });
+  }
+});
+
 
 // ====== ERROR HANDLERS ======
 app.use((err, req, res, next) => {
