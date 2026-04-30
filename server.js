@@ -718,6 +718,56 @@ app.post("/api/feed/comment", async (req, res, next) => {
 });
 
 
+// Small delay helper for natural AI reply timing
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isGeminiRateLimitError(err) {
+  const rawMessage = err && err.message ? String(err.message) : "";
+  const lowerMessage = rawMessage.toLowerCase();
+
+  return (
+    rawMessage.includes("429") ||
+    lowerMessage.includes("too many requests") ||
+    lowerMessage.includes("quota") ||
+    lowerMessage.includes("rate limit") ||
+    lowerMessage.includes("resource exhausted")
+  );
+}
+
+async function generateCoachAnswerWithFallback(prompt) {
+  const primaryModel = process.env.GEMINI_MODEL || "gemini-2.5-flash-lite";
+  const backupModel = process.env.GEMINI_BACKUP_MODEL || "gemini-1.5-flash";
+
+  const modelNames = [...new Set([primaryModel, backupModel].filter(Boolean))];
+  let lastError = null;
+
+  for (const modelName of modelNames) {
+    try {
+      console.log(`AI coach trying Gemini model: ${modelName}`);
+      const model = genAI.getGenerativeModel({ model: modelName });
+      const result = await model.generateContent(prompt);
+      return {
+        text: result.response.text(),
+        modelName,
+      };
+    } catch (err) {
+      lastError = err;
+      console.error(`AI coach model failed (${modelName}):`, err && err.message ? err.message : err);
+
+      if (!isGeminiRateLimitError(err)) {
+        throw err;
+      }
+
+      // If primary model is rate-limited, try the next backup model.
+      continue;
+    }
+  }
+
+  throw lastError || new Error("All Gemini models failed.");
+}
+
 // ====== AI COACH (GEMINI) ======
 function safeArray(value) {
   if (Array.isArray(value)) {
@@ -840,11 +890,6 @@ app.post("/api/coach/chat", async (req, res) => {
       body.chatHistory
     );
 
-    const model = genAI.getGenerativeModel({
-      // gemini-1.5-flash can return 404 now. Use newer free/low-cost Flash-Lite.
-      model: process.env.GEMINI_MODEL || "gemini-2.5-flash-lite"
-    });
-
     const prompt = `
 You are Trade Journal Pro AI Coach.
 
@@ -883,26 +928,57 @@ ${message}
 Reply as a real human. Make it natural, useful, and not spammy.
 `;
 
-    const result = await model.generateContent(prompt);
-    const answerRaw = result.response.text();
+    const generated = await generateCoachAnswerWithFallback(prompt);
+    const answerRaw = generated.text;
     const answer = normalizeString(answerRaw, "", 2500);
 
     if (!answer) {
+      await sleep(5000);
       return res.json({
-        answer: "I could not generate a coach response. Try again."
+        answer: "Hmm, my brain blanked for a second 😅 Try asking that again."
       });
     }
+
+    // Natural online AI timing: do not reply instantly.
+    await sleep(5000);
 
     return res.json({ answer });
   } catch (err) {
     console.error("AI coach error:", err);
 
-    const rawMessage =
-      err && err.message ? String(err.message) : "Unknown Gemini error";
-    const safeMessage = rawMessage.slice(0, 600);
+    const rawMessage = err && err.message ? String(err.message) : "";
+    const lowerMessage = rawMessage.toLowerCase();
 
-    return res.status(500).json({
-      answer: `AI coach failed: ${safeMessage}`
+    let safeAnswer = "⚠️ I had a small connection hiccup 😅 Try again in a moment.";
+
+    if (
+      rawMessage.includes("429") ||
+      lowerMessage.includes("too many requests") ||
+      lowerMessage.includes("quota")
+    ) {
+      safeAnswer =
+        "😅 I’m a bit overloaded right now. I tried my backup brain too — give me a short moment and try again.";
+    } else if (
+      lowerMessage.includes("api key") ||
+      lowerMessage.includes("permission") ||
+      lowerMessage.includes("unauthorized")
+    ) {
+      safeAnswer =
+        "⚠️ AI connection needs a quick backend check. Try again later.";
+    } else if (
+      lowerMessage.includes("timeout") ||
+      lowerMessage.includes("fetch failed") ||
+      lowerMessage.includes("network")
+    ) {
+      safeAnswer =
+        "⚠️ Internet connection is a little unstable right now. Try again in a moment.";
+    }
+
+    // Keep timing consistent even when Gemini fails.
+    await sleep(5000);
+
+    return res.json({
+      answer: safeAnswer
     });
   }
 });
