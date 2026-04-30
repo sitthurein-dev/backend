@@ -723,49 +723,20 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function isGeminiRateLimitError(err) {
-  const rawMessage = err && err.message ? String(err.message) : "";
-  const lowerMessage = rawMessage.toLowerCase();
+async function generateCoachAnswer(prompt) {
+  // Stable chat model for smoother free-tier usage.
+  // You can override it in Render with GEMINI_MODEL if needed.
+  const modelName = process.env.GEMINI_MODEL || "gemini-1.5-flash";
 
-  return (
-    rawMessage.includes("429") ||
-    lowerMessage.includes("too many requests") ||
-    lowerMessage.includes("quota") ||
-    lowerMessage.includes("rate limit") ||
-    lowerMessage.includes("resource exhausted")
-  );
-}
+  console.log(`AI coach using Gemini model: ${modelName}`);
 
-async function generateCoachAnswerWithFallback(prompt) {
-  const primaryModel = process.env.GEMINI_MODEL || "gemini-2.5-flash-lite";
-  const backupModel = process.env.GEMINI_BACKUP_MODEL || "gemini-1.5-flash";
+  const model = genAI.getGenerativeModel({ model: modelName });
+  const result = await model.generateContent(prompt);
 
-  const modelNames = [...new Set([primaryModel, backupModel].filter(Boolean))];
-  let lastError = null;
-
-  for (const modelName of modelNames) {
-    try {
-      console.log(`AI coach trying Gemini model: ${modelName}`);
-      const model = genAI.getGenerativeModel({ model: modelName });
-      const result = await model.generateContent(prompt);
-      return {
-        text: result.response.text(),
-        modelName,
-      };
-    } catch (err) {
-      lastError = err;
-      console.error(`AI coach model failed (${modelName}):`, err && err.message ? err.message : err);
-
-      if (!isGeminiRateLimitError(err)) {
-        throw err;
-      }
-
-      // If primary model is rate-limited, try the next backup model.
-      continue;
-    }
-  }
-
-  throw lastError || new Error("All Gemini models failed.");
+  return {
+    text: result.response.text(),
+    modelName,
+  };
 }
 
 // ====== AI COACH (GEMINI) ======
@@ -928,7 +899,7 @@ ${message}
 Reply as a real human. Make it natural, useful, and not spammy.
 `;
 
-    const generated = await generateCoachAnswerWithFallback(prompt);
+    const generated = await generateCoachAnswer(prompt);
     const answerRaw = generated.text;
     const answer = normalizeString(answerRaw, "", 2500);
 
@@ -957,7 +928,7 @@ Reply as a real human. Make it natural, useful, and not spammy.
       lowerMessage.includes("quota")
     ) {
       safeAnswer =
-        "😅 I’m a bit overloaded right now. I tried my backup brain too — give me a short moment and try again.";
+        "😅 I’m a bit overloaded right now. Give me a short moment and try again.";
     } else if (
       lowerMessage.includes("api key") ||
       lowerMessage.includes("permission") ||
