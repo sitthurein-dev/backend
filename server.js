@@ -834,7 +834,8 @@ app.post("/api/coach/chat", async (req, res) => {
     );
 
     const model = genAI.getGenerativeModel({
-      model: process.env.GEMINI_MODEL || "gemini-1.5-flash"
+      // gemini-1.5-flash can return 404 now. Use newer free/low-cost Flash-Lite.
+      model: process.env.GEMINI_MODEL || "gemini-2.5-flash-lite"
     });
 
     const prompt = `
@@ -862,8 +863,7 @@ Answer format:
 `;
 
     const result = await model.generateContent(prompt);
-    const response = await result.response;
-    const answerRaw = response.text();
+    const answerRaw = result.response.text();
     const answer = normalizeString(answerRaw, "", 2500);
 
     if (!answer) {
@@ -875,8 +875,13 @@ Answer format:
     return res.json({ answer });
   } catch (err) {
     console.error("AI coach error:", err);
+
+    const rawMessage =
+      err && err.message ? String(err.message) : "Unknown Gemini error";
+    const safeMessage = rawMessage.slice(0, 600);
+
     return res.status(500).json({
-      answer: "AI coach failed. Try again later."
+      answer: `AI coach failed: ${safeMessage}`
     });
   }
 });
