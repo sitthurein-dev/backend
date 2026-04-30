@@ -723,23 +723,260 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function generateCoachAnswer(prompt) {
-  // Stable chat model for smoother free-tier usage.
-  // You can override it in Render with GEMINI_MODEL if needed.
-  const modelName = process.env.GEMINI_MODEL || "gemini-1.5-flash";
+// ====== DAILY ONLINE AI LIMIT ======
+// Server handles real online AI only.
+// Simple/offline chat should stay in main.dart to avoid double offline engines.
+const dailyAiUsage = {};
+const DAILY_ONLINE_AI_LIMIT = Number(process.env.DAILY_ONLINE_AI_LIMIT || 10);
 
-  console.log(`AI coach using Gemini model: ${modelName}`);
+function getCoachUserKey(req, body) {
+  const explicitUserId = normalizeString(
+    body.user_id || body.userId || body.feedUserId || body.deviceId,
+    "",
+    120
+  );
+
+  if (explicitUserId) return `user:${explicitUserId}`;
+
+  return `ip:${getClientIp(req)}`;
+}
+
+function canUseOnlineAI(userKey) {
+  const today = getTodayKey();
+
+  if (!dailyAiUsage[userKey] || dailyAiUsage[userKey].day !== today) {
+    dailyAiUsage[userKey] = { count: 0, day: today };
+  }
+
+  return dailyAiUsage[userKey].count < DAILY_ONLINE_AI_LIMIT;
+}
+
+function increaseOnlineAiUsage(userKey) {
+  const today = getTodayKey();
+
+  if (!dailyAiUsage[userKey] || dailyAiUsage[userKey].day !== today) {
+    dailyAiUsage[userKey] = { count: 0, day: today };
+  }
+
+  dailyAiUsage[userKey].count += 1;
+}
+
+function cleanupOldDailyAiUsage() {
+  const today = getTodayKey();
+
+  for (const key of Object.keys(dailyAiUsage)) {
+    if (dailyAiUsage[key].day !== today) {
+      delete dailyAiUsage[key];
+    }
+  }
+}
+
+setInterval(cleanupOldDailyAiUsage, 60 * 60 * 1000).unref();
+
+function emergencyCoachMessage() {
+  return "I’m in light mode right now 😅 Try again later for deeper online coaching.";
+}
+
+function isRetryableAiError(err) {
+  const rawMessage = err && err.message ? String(err.message) : "";
+  const lowerMessage = rawMessage.toLowerCase();
+
+  return (
+    rawMessage.includes("429") ||
+    rawMessage.includes("500") ||
+    rawMessage.includes("502") ||
+    rawMessage.includes("503") ||
+    rawMessage.includes("504") ||
+    lowerMessage.includes("too many requests") ||
+    lowerMessage.includes("quota") ||
+    lowerMessage.includes("rate limit") ||
+    lowerMessage.includes("resource exhausted") ||
+    lowerMessage.includes("timeout") ||
+    lowerMessage.includes("fetch failed") ||
+    lowerMessage.includes("network")
+  );
+}
+
+async function fetchJsonWithTimeout(url, options = {}, timeoutMs = 25000) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const response = await fetch(url, {
+      ...options,
+      signal: controller.signal,
+    });
+
+    const text = await response.text();
+    let data = {};
+
+    try {
+      data = text ? JSON.parse(text) : {};
+    } catch (_) {
+      data = { raw: text };
+    }
+
+    if (!response.ok) {
+      const errorMessage =
+        data.error?.message ||
+        data.error ||
+        data.message ||
+        data.raw ||
+        `HTTP ${response.status}`;
+      throw new Error(`${response.status}: ${errorMessage}`);
+    }
+
+    return data;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function askGemini(prompt) {
+  if (!genAI) {
+    throw new Error("Gemini key is missing.");
+  }
+
+  const modelName = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+  console.log(`AI coach trying Gemini model: ${modelName}`);
 
   const model = genAI.getGenerativeModel({ model: modelName });
   const result = await model.generateContent(prompt);
+  const text = result.response.text();
 
   return {
-    text: result.response.text(),
+    text,
+    provider: "Gemini",
     modelName,
   };
 }
 
-// ====== AI COACH (GEMINI) ======
+async function askOpenRouter(prompt) {
+  const apiKey = process.env.OPENROUTER_API_KEY;
+  if (!apiKey) {
+    throw new Error("OpenRouter key is missing.");
+  }
+
+  const modelName =
+    process.env.OPENROUTER_MODEL || "deepseek/deepseek-chat-v3-0324:free";
+
+  console.log(`AI coach trying OpenRouter model: ${modelName}`);
+
+  const data = await fetchJsonWithTimeout(
+    "https://openrouter.ai/api/v1/chat/completions",
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+        "HTTP-Referer": process.env.APP_PUBLIC_URL || "https://trade-journal-backend-sz8r.onrender.com",
+        "X-Title": "Trade Journal Pro",
+      },
+      body: JSON.stringify({
+        model: modelName,
+        messages: [
+          {
+            role: "user",
+            content: prompt,
+          },
+        ],
+        temperature: 0.8,
+        max_tokens: 700,
+      }),
+    }
+  );
+
+  return {
+    text: data.choices?.[0]?.message?.content || "",
+    provider: "OpenRouter",
+    modelName,
+  };
+}
+
+async function askGroq(prompt) {
+  const apiKey = process.env.GROQ_API_KEY;
+  if (!apiKey) {
+    throw new Error("Groq key is missing.");
+  }
+
+  const modelName = process.env.GROQ_MODEL || "llama-3.1-8b-instant";
+
+  console.log(`AI coach trying Groq model: ${modelName}`);
+
+  const data = await fetchJsonWithTimeout(
+    "https://api.groq.com/openai/v1/chat/completions",
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: modelName,
+        messages: [
+          {
+            role: "user",
+            content: prompt,
+          },
+        ],
+        temperature: 0.8,
+        max_tokens: 700,
+      }),
+    }
+  );
+
+  return {
+    text: data.choices?.[0]?.message?.content || "",
+    provider: "Groq",
+    modelName,
+  };
+}
+
+async function generateCoachAnswer(prompt) {
+  const providers = [
+    { name: "Gemini", run: askGemini },
+    { name: "OpenRouter", run: askOpenRouter },
+    { name: "Groq", run: askGroq },
+  ];
+
+  let lastRetryableError = null;
+
+  for (const provider of providers) {
+    try {
+      const result = await provider.run(prompt);
+      const text = String(result.text || "").trim();
+
+      if (text.length > 0) {
+        console.log(`✅ AI coach success with ${provider.name}`);
+        return {
+          text,
+          provider: result.provider || provider.name,
+          modelName: result.modelName || "",
+        };
+      }
+
+      throw new Error(`${provider.name} returned empty text.`);
+    } catch (err) {
+      const message = err && err.message ? err.message : String(err);
+      console.warn(`❌ AI provider failed (${provider.name}): ${message}`);
+
+      if (isRetryableAiError(err) || provider.name !== "Groq") {
+        lastRetryableError = err;
+        continue;
+      }
+
+      throw err;
+    }
+  }
+
+  if (lastRetryableError) {
+    throw lastRetryableError;
+  }
+
+  throw new Error("All AI providers failed.");
+}
+
+// ====== AI COACH (MULTI PROVIDER) ======
 function safeArray(value) {
   if (Array.isArray(value)) {
     return value;
@@ -837,14 +1074,9 @@ app.post("/api/coach/chat", async (req, res) => {
     const ip = getClientIp(req);
 
     if (isRateLimited(`coach:${ip}`, 40)) {
-      return res.status(429).json({
-        answer: "Too many coach requests. Slow down for a minute and try again."
-      });
-    }
-
-    if (!genAI) {
-      return res.status(503).json({
-        answer: "AI coach is not configured yet. Add GEMINI_API_KEY in Render Environment Variables."
+      await sleep(1200);
+      return res.json({
+        answer: "Easy there 😄 Too many messages too fast. Give me a moment."
       });
     }
 
@@ -860,6 +1092,19 @@ app.post("/api/coach/chat", async (req, res) => {
       body.importedTrades,
       body.chatHistory
     );
+
+    const userKey = getCoachUserKey(req, body);
+
+    // Daily online AI cap: after 10 online replies, stop calling paid/free APIs.
+    // main.dart should handle simple/offline replies before calling this route.
+    if (!canUseOnlineAI(userKey)) {
+      await sleep(800);
+      return res.json({
+        answer: emergencyCoachMessage(),
+        mode: "online_daily_limit_reached",
+        remainingOnlineReplies: 0
+      });
+    }
 
     const prompt = `
 You are Trade Journal Pro AI Coach.
@@ -899,57 +1144,51 @@ ${message}
 Reply as a real human. Make it natural, useful, and not spammy.
 `;
 
-    const generated = await generateCoachAnswer(prompt);
-    const answerRaw = generated.text;
-    const answer = normalizeString(answerRaw, "", 2500);
+    try {
+      const generated = await generateCoachAnswer(prompt);
+      const answerRaw = generated.text;
+      const answer = normalizeString(answerRaw, "", 2500);
 
-    if (!answer) {
-      await sleep(5000);
+      if (answer) {
+        increaseOnlineAiUsage(userKey);
+
+        // Natural online AI timing: do not reply instantly.
+        await sleep(5000);
+
+        return res.json({
+          answer,
+          mode: "online_ai",
+          provider: generated.provider || "",
+          model: generated.modelName || "",
+          remainingOnlineReplies:
+            Math.max(DAILY_ONLINE_AI_LIMIT - (dailyAiUsage[userKey]?.count || 0), 0)
+        });
+      }
+
+      await sleep(800);
       return res.json({
-        answer: "Hmm, my brain blanked for a second 😅 Try asking that again."
+        answer: emergencyCoachMessage(),
+        mode: "online_empty_ai"
+      });
+    } catch (aiErr) {
+      console.error("AI coach online providers failed:", aiErr);
+
+      // If every provider fails / quota is used, do not expose ugly errors.
+      // Keep this as emergency backend fallback only; main.dart owns the richer offline engine.
+      await sleep(800);
+      return res.json({
+        answer: emergencyCoachMessage(),
+        mode: "online_ai_failed"
       });
     }
-
-    // Natural online AI timing: do not reply instantly.
-    await sleep(5000);
-
-    return res.json({ answer });
   } catch (err) {
-    console.error("AI coach error:", err);
+    console.error("AI coach route error:", err);
 
-    const rawMessage = err && err.message ? String(err.message) : "";
-    const lowerMessage = rawMessage.toLowerCase();
-
-    let safeAnswer = "⚠️ I had a small connection hiccup 😅 Try again in a moment.";
-
-    if (
-      rawMessage.includes("429") ||
-      lowerMessage.includes("too many requests") ||
-      lowerMessage.includes("quota")
-    ) {
-      safeAnswer =
-        "😅 I’m a bit overloaded right now. Give me a short moment and try again.";
-    } else if (
-      lowerMessage.includes("api key") ||
-      lowerMessage.includes("permission") ||
-      lowerMessage.includes("unauthorized")
-    ) {
-      safeAnswer =
-        "⚠️ AI connection needs a quick backend check. Try again later.";
-    } else if (
-      lowerMessage.includes("timeout") ||
-      lowerMessage.includes("fetch failed") ||
-      lowerMessage.includes("network")
-    ) {
-      safeAnswer =
-        "⚠️ Internet connection is a little unstable right now. Try again in a moment.";
-    }
-
-    // Keep timing consistent even when Gemini fails.
-    await sleep(5000);
+    await sleep(1000);
 
     return res.json({
-      answer: safeAnswer
+      answer: emergencyCoachMessage(),
+      mode: "online_route_error"
     });
   }
 });
