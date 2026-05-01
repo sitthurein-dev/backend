@@ -1192,7 +1192,7 @@ Reply as a real human. Make it natural, useful, and not spammy.
         increaseOnlineAiUsage(userKey);
 
         // Natural online AI timing: do not reply instantly.
-        await sleep(5000);
+        await sleep(2000);
 
         return res.json({
           answer,
