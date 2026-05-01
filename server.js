@@ -6,14 +6,46 @@ const { GoogleGenerativeAI } = require("@google/generative-ai");
 const app = express();
 
 
-// ====== GEMINI AI SETUP ======
-let genAI = null;
+// ====== AI API KEY SETUP ======
+// Add more keys in Render using these names and the server will auto-use them:
+// GEMINI_API_KEY, GEMINI_API_KEY_2, GEMINI_API_KEY_3...
+// OPENROUTER_API_KEY, OPENROUTER_API_KEY_2, OPENROUTER_API_KEY_3...
+// GROQ_API_KEY, GROQ_API_KEY_2, GROQ_API_KEY_3...
+function collectEnvKeys(baseName) {
+  const keys = [];
+  const seen = new Set();
 
-if (process.env.GEMINI_API_KEY) {
-  genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-} else {
-  console.warn("⚠️ GEMINI_API_KEY is missing. AI coach will use fallback error responses until you add it in Render Environment Variables.");
+  function add(value) {
+    const key = String(value || "").trim();
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    keys.push(key);
+  }
+
+  add(process.env[baseName]);
+
+  for (let i = 2; i <= 20; i += 1) {
+    add(process.env[`${baseName}_${i}`]);
+  }
+
+  return keys;
 }
+
+const GEMINI_API_KEYS = collectEnvKeys("GEMINI_API_KEY");
+const OPENROUTER_API_KEYS = collectEnvKeys("OPENROUTER_API_KEY");
+const GROQ_API_KEYS = collectEnvKeys("GROQ_API_KEY");
+
+if (GEMINI_API_KEYS.length === 0) {
+  console.warn("⚠️ No Gemini keys found. Add GEMINI_API_KEY or GEMINI_API_KEY_2 in Render Environment Variables.");
+}
+if (OPENROUTER_API_KEYS.length === 0) {
+  console.warn("⚠️ No OpenRouter keys found. Add OPENROUTER_API_KEY or OPENROUTER_API_KEY_2 in Render Environment Variables.");
+}
+if (GROQ_API_KEYS.length === 0) {
+  console.warn("⚠️ No Groq keys found. Add GROQ_API_KEY or GROQ_API_KEY_2 in Render Environment Variables.");
+}
+
+console.log(`AI keys loaded: Gemini=${GEMINI_API_KEYS.length}, OpenRouter=${OPENROUTER_API_KEYS.length}, Groq=${GROQ_API_KEYS.length}`);
 
 
 // ====== BASIC APP HARDENING ======
@@ -832,15 +864,16 @@ async function fetchJsonWithTimeout(url, options = {}, timeoutMs = 25000) {
   }
 }
 
-async function askGemini(prompt) {
-  if (!genAI) {
+async function askGemini(prompt, apiKey, keyIndex = 0) {
+  if (!apiKey) {
     throw new Error("Gemini key is missing.");
   }
 
   const modelName = process.env.GEMINI_MODEL || "gemini-2.5-flash";
-  console.log(`AI coach trying Gemini model: ${modelName}`);
+  console.log(`AI coach trying Gemini model: ${modelName} key #${keyIndex + 1}`);
 
-  const model = genAI.getGenerativeModel({ model: modelName });
+  const client = new GoogleGenerativeAI(apiKey);
+  const model = client.getGenerativeModel({ model: modelName });
   const result = await model.generateContent(prompt);
   const text = result.response.text();
 
@@ -848,11 +881,11 @@ async function askGemini(prompt) {
     text,
     provider: "Gemini",
     modelName,
+    keyIndex,
   };
 }
 
-async function askOpenRouter(prompt) {
-  const apiKey = process.env.OPENROUTER_API_KEY;
+async function askOpenRouter(prompt, apiKey, keyIndex = 0) {
   if (!apiKey) {
     throw new Error("OpenRouter key is missing.");
   }
@@ -860,7 +893,7 @@ async function askOpenRouter(prompt) {
   const modelName =
     process.env.OPENROUTER_MODEL || "deepseek/deepseek-chat-v3-0324:free";
 
-  console.log(`AI coach trying OpenRouter model: ${modelName}`);
+  console.log(`AI coach trying OpenRouter model: ${modelName} key #${keyIndex + 1}`);
 
   const data = await fetchJsonWithTimeout(
     "https://openrouter.ai/api/v1/chat/completions",
@@ -890,18 +923,18 @@ async function askOpenRouter(prompt) {
     text: data.choices?.[0]?.message?.content || "",
     provider: "OpenRouter",
     modelName,
+    keyIndex,
   };
 }
 
-async function askGroq(prompt) {
-  const apiKey = process.env.GROQ_API_KEY;
+async function askGroq(prompt, apiKey, keyIndex = 0) {
   if (!apiKey) {
     throw new Error("Groq key is missing.");
   }
 
   const modelName = process.env.GROQ_MODEL || "llama-3.1-8b-instant";
 
-  console.log(`AI coach trying Groq model: ${modelName}`);
+  console.log(`AI coach trying Groq model: ${modelName} key #${keyIndex + 1}`);
 
   const data = await fetchJsonWithTimeout(
     "https://api.groq.com/openai/v1/chat/completions",
@@ -929,43 +962,49 @@ async function askGroq(prompt) {
     text: data.choices?.[0]?.message?.content || "",
     provider: "Groq",
     modelName,
+    keyIndex,
   };
 }
 
 async function generateCoachAnswer(prompt) {
   const providers = [
-    { name: "Gemini", run: askGemini },
-    { name: "OpenRouter", run: askOpenRouter },
-    { name: "Groq", run: askGroq },
+    { name: "Gemini", keys: GEMINI_API_KEYS, run: askGemini },
+    { name: "OpenRouter", keys: OPENROUTER_API_KEYS, run: askOpenRouter },
+    { name: "Groq", keys: GROQ_API_KEYS, run: askGroq },
   ];
 
   let lastRetryableError = null;
 
   for (const provider of providers) {
-    try {
-      const result = await provider.run(prompt);
-      const text = String(result.text || "").trim();
+    if (!provider.keys || provider.keys.length === 0) {
+      console.warn(`⚠️ AI provider skipped (${provider.name}): no API keys configured.`);
+      continue;
+    }
 
-      if (text.length > 0) {
-        console.log(`✅ AI coach success with ${provider.name}`);
-        return {
-          text,
-          provider: result.provider || provider.name,
-          modelName: result.modelName || "",
-        };
-      }
+    for (let keyIndex = 0; keyIndex < provider.keys.length; keyIndex += 1) {
+      try {
+        const result = await provider.run(prompt, provider.keys[keyIndex], keyIndex);
+        const text = String(result.text || "").trim();
 
-      throw new Error(`${provider.name} returned empty text.`);
-    } catch (err) {
-      const message = err && err.message ? err.message : String(err);
-      console.warn(`❌ AI provider failed (${provider.name}): ${message}`);
+        if (text.length > 0) {
+          console.log(`✅ AI coach success with ${provider.name} key #${keyIndex + 1}`);
+          return {
+            text,
+            provider: result.provider || provider.name,
+            modelName: result.modelName || "",
+            keyIndex,
+          };
+        }
 
-      if (isRetryableAiError(err) || provider.name !== "Groq") {
+        throw new Error(`${provider.name} key #${keyIndex + 1} returned empty text.`);
+      } catch (err) {
+        const message = err && err.message ? err.message : String(err);
+        console.warn(`❌ AI provider failed (${provider.name} key #${keyIndex + 1}): ${message}`);
+
+        // Try the next key/provider for quota, rate limit, timeout, network, and empty-response issues.
         lastRetryableError = err;
         continue;
       }
-
-      throw err;
     }
   }
 
@@ -973,7 +1012,7 @@ async function generateCoachAnswer(prompt) {
     throw lastRetryableError;
   }
 
-  throw new Error("All AI providers failed.");
+  throw new Error("All AI providers failed or no API keys were configured.");
 }
 
 // ====== AI COACH (MULTI PROVIDER) ======
