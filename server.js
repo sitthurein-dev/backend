@@ -759,7 +759,7 @@ function sleep(ms) {
 // Server handles real online AI only.
 // Simple/offline chat should stay in main.dart to avoid double offline engines.
 const dailyAiUsage = {};
-const DAILY_ONLINE_AI_LIMIT = Number(process.env.DAILY_ONLINE_AI_LIMIT || 10);
+const DAILY_ONLINE_AI_LIMIT = Number(process.env.DAILY_ONLINE_AI_LIMIT || 20);
 
 function getCoachUserKey(req, body) {
   const explicitUserId = normalizeString(
